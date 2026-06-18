@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Komfy Bridge</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      width: 280px;
+      background: #0f1117;
+      color: #e0e0e0;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 12px 10px;
+      border-bottom: 1px solid #1e2030;
+      white-space: nowrap;
+    }
+    .header img { width: 16px; height: 16px; border-radius: 4px; }
+    .header h1 { font-size: 12px; font-weight: 600; color: #fff; letter-spacing: 0.2px; }
+    .header .spacer { flex: 1; }
+    .btn-sync-small {
+      background: transparent;
+      border: 1px solid #2e3144;
+      color: #8b909a;
+      font-size: 10px;
+      font-weight: 500;
+      padding: 3px 6px;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .btn-sync-small:hover {
+      background: #1e2030;
+      color: #e0e0e0;
+      border-color: #3d4250;
+    }
+    .btn-sync-small:active { transform: scale(0.96); }
+
+    /* Button inside accordion */
+    .btn-use-project {
+      background: transparent;
+      border: 1px solid #6366f155;
+      color: #818cf8;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 5px 7px;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+      flex-shrink: 0;
+      width: 100%;
+      margin-top: 8px;
+    }
+    .btn-use-project:hover {
+      background: #6366f122;
+      color: #a5b4fc;
+      border-color: #6366f1;
+    }
+    .btn-use-project:active { transform: scale(0.96); }
+    .btn-use-project.success { border-color: #22c55e; color: #22c55e; }
+    .btn-use-project.error   { border-color: #ef4444; color: #ef4444; }
+
+    /* Manual reload button */
+    .btn-reload-manual {
+      display: block;
+      width: calc(100% - 32px);
+      margin: 12px 16px 12px;
+      padding: 7px;
+      background: transparent;
+      color: #f59e0b;
+      border: 1px solid #f59e0b55;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      letter-spacing: 0.2px;
+    }
+    .btn-reload-manual:hover { background: #f59e0b22; border-color: #f59e0b; }
+    .btn-reload-manual:active { transform: scale(0.97); }
+
+    /* Status dot */
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      border-bottom: 1px solid #1e2030;
+    }
+    .status-label { font-size: 12px; color: #8b909a; }
+    .badge {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot.green  { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    .dot.red    { background: #ef4444; }
+    .dot.yellow { background: #f59e0b; }
+    .dot.gray   { background: #5a606e; }
+
+    /* Accordion */
+    .section-title {
+      font-size: 10px;
+      color: #5a606e;
+      font-weight: 600;
+      letter-spacing: 1px;
+      padding: 12px 16px 4px;
+      text-transform: uppercase;
+    }
+
+    .accordion {
+      border-bottom: 1px solid #1e2030;
+    }
+    .accordion-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s;
+    }
+    .accordion-header:hover { background: #1e203055; }
+    .acc-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      color: #e0e0e0;
+    }
+    .acc-arrow {
+      font-size: 9px;
+      color: #5a606e;
+      transition: transform 0.2s ease;
+      display: inline-block;
+    }
+    .accordion.expanded .acc-arrow { transform: rotate(90deg); }
+    .accordion-content {
+      display: none;
+      padding: 0 16px 12px 28px;
+    }
+    .accordion.expanded .accordion-content { display: block; }
+
+    /* Info block */
+    .info-block {
+      padding: 5px 0;
+    }
+    .info-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0;
+    }
+    .info-key { font-size: 11px; color: #8b909a; }
+    .info-val {
+      font-size: 11px;
+      font-family: 'Courier New', monospace;
+      color: #a5b4fc;
+      max-width: 150px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .info-val.ok  { color: #22c55e; font-family: inherit; }
+    .info-val.err { color: #ef4444; font-family: inherit; }
+
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <img src="icon-32.png" alt="icon">
+    <h1>Komfy Bridge</h1>
+    <div class="spacer"></div>
+    <button class="btn-sync-small" id="btn-clear" title="Clear Project Cache">🗑️ Clear</button>
+  </div>
+
+  <div class="status-row">
+    <span class="status-label">Komfy Studio</span>
+    <span class="badge">
+      <span class="dot" id="dot-studio"></span>
+      <span id="studio-status">Checking...</span>
+    </span>
+  </div>
+
+  <div class="section-title">PLUGINS & SESSIONS</div>
+
+  <!-- Google Flow Card -->
+  <div class="accordion" id="acc-google">
+    <div class="accordion-header" id="header-google">
+      <div class="acc-title">
+        <span class="acc-arrow">▶</span>
+        <span>🔵</span> Google Flow
+      </div>
+      <span class="badge">
+        <span class="dot" id="dot-token"></span>
+        <span id="token-status">No token</span>
+      </span>
+    </div>
+    <div class="accordion-content">
+      <div class="info-block">
+        <div class="info-item">
+          <span class="info-key">Project</span>
+          <span class="info-val" id="project-name">—</span>
+        </div>
+        <div class="info-item">
+          <span class="info-key">ID</span>
+          <span class="info-val" id="project-id" style="font-size:10px;opacity:0.6; cursor:pointer;" title="Double-click to clear project cache">—</span>
+        </div>
+        <div class="info-item">
+          <span class="info-key">Last sync</span>
+          <span class="info-val" id="last-sync">—</span>
+        </div>
+      </div>
+      <button class="btn-use-project" id="btn-use-project" title="Use the project currently open in Komfy Studio">📌 Pin Current Tab</button>
+    </div>
+  </div>
+
+  <!-- ChatGPT Web Card -->
+  <div class="accordion" id="acc-chatgpt">
+    <div class="accordion-header" id="header-chatgpt">
+      <div class="acc-title">
+        <span class="acc-arrow">▶</span>
+        <span>🟢</span> ChatGPT Web
+      </div>
+      <span class="badge">
+        <span class="dot gray" id="dot-chatgpt"></span>
+        <span id="chatgpt-status">Inactive</span>
+      </span>
+    </div>
+    <div class="accordion-content">
+      <div class="info-block">
+        <div class="info-item">
+          <span class="info-key">Status</span>
+          <span class="info-val" id="chatgpt-tab-status" style="color:#8b909a;">Not connected</span>
+        </div>
+      </div>
+      <button class="btn-use-project" id="btn-pin-chatgpt" title="Tự động tìm tab ChatGPT đang mở, hoặc mở tab mới" style="border-color:#22c55e55; color:#4ade80;">🔗 Connect / Open ChatGPT</button>
+    </div>
+  </div>
+
+  <!-- Grok Imagine Card -->
+  <div class="accordion" id="acc-grok">
+    <div class="accordion-header" id="header-grok">
+      <div class="acc-title">
+        <span class="acc-arrow">▶</span>
+        <span>🟣</span> Grok Imagine
+      </div>
+      <span class="badge">
+        <span class="dot gray" id="dot-grok"></span>
+        <span id="grok-status">Inactive</span>
+      </span>
+    </div>
+    <div class="accordion-content">
+      <div class="info-block">
+        <div class="info-item">
+          <span class="info-key">Status</span>
+          <span class="info-val" id="grok-tab-status" style="color:#8b909a;">Not connected</span>
+        </div>
+      </div>
+      <button class="btn-use-project" id="btn-pin-grok" title="Tự động tìm tab grok.com đang mở, hoặc mở tab mới" style="border-color:#8b5cf655; color:#a78bfa;">🔗 Connect / Open Grok</button>
+    </div>
+  </div>
+
+  <button class="btn-reload-manual" id="btn-reload-manual" title="Reload extension sau khi update code">🔄 Reload Extension</button>
+
+  <script src="popup.js"></script>
+</body>
+</html>

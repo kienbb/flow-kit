@@ -1,0 +1,1504 @@
+// Task polling loop + webRequest token capture.
+
+// =========================================================
+// IMAGE UPLOAD CACHE — tranh upload lai anh da co mediaId
+// Key: hash cua imageBytes (dau + cuoi + length)
+// Value: { mediaId, projectId, timestamp }
+// =========================================================
+const __uploadCache = new Map();
+const UPLOAD_CACHE_MAX_AGE = 4 * 60 * 60 * 1000; // 4 gio
+
+function computeImageHash(imageBytes) {
+    // Fast hash: length + first 64 chars + last 64 chars
+    // Du de phan biet cac anh khac nhau ma khong can crypto
+    const len = imageBytes.length;
+    const head = imageBytes.substring(0, 64);
+    const tail = imageBytes.substring(Math.max(0, len - 64));
+    return len + ':' + head + ':' + tail;
+}
+
+function getCachedMediaId(imageBytes, projectId) {
+    const hash = computeImageHash(imageBytes);
+    const cached = __uploadCache.get(hash);
+    if (!cached) return null;
+    // Check: cung project + chua het han
+    if (cached.projectId !== projectId) return null;
+    if (Date.now() - cached.timestamp > UPLOAD_CACHE_MAX_AGE) {
+        __uploadCache.delete(hash);
+        return null;
+    }
+    return cached.mediaId;
+}
+
+function setCachedMediaId(imageBytes, projectId, mediaId) {
+    const hash = computeImageHash(imageBytes);
+    __uploadCache.set(hash, { mediaId, projectId, timestamp: Date.now() });
+    // Gioi han cache size
+    if (__uploadCache.size > 200) {
+        const oldest = __uploadCache.keys().next().value;
+        __uploadCache.delete(oldest);
+    }
+}
+
+// =========================================================
+// LONG-POLL: Nhan lenh tu server
+// =========================================================
+// =========================================================
+// TASK PROCESSOR (chay song song, mutex trong extension serializes UI)
+// =========================================================
+async function processTask(task) {
+    // ★ Extract projectName from task body for project lock
+    let lockProjectName = null;
+    try {
+        const _body = typeof task.body === 'string' ? JSON.parse(task.body) : (task.body || {});
+        lockProjectName = _body.projectName || null;
+    } catch(e) {}
+
+    // Acquire project lock — waits if a different project is active with running tasks
+    await acquireProjectLock(lockProjectName);
+
+    let result;
+    try {
+        if (task.endpoint === 'RELOAD_EXTENSION') {
+            // Remote reload — ExtensionManager calls this after auto-update
+            console.log('[Komfy] 🔄 RELOAD_EXTENSION received — reloading in 600ms...');
+            result = { ok: true, status: 200, body: '{"reloading":true}' };
+            // Delay slightly so this response can be sent back before SW terminates
+            setTimeout(() => chrome.runtime.reload(), 600);
+
+        } else if (task.endpoint === 'PREPARE_PROJECT') {
+
+            // ★ Pre-warm: verify/create project BEFORE any upload/generate task
+            const body = typeof task.body === 'string' ? JSON.parse(task.body) : task.body;
+            const pName = body.projectName || null;
+            if (pName) {
+                console.log('[Komfy] PREPARE_PROJECT:', pName);
+                await ensureFlowTab(false, pName);
+                const pid = sessionData.projectId;
+                console.log('[Komfy] PREPARE_PROJECT ✅', pName, '→', pid ? pid.substring(0, 16) : 'no-id');
+                result = { ok: true, status: 200, body: JSON.stringify({ projectId: pid, projectName: pName }) };
+            } else {
+                result = { ok: true, status: 200, body: '{"skipped":"no projectName"}' };
+            }
+
+        } else if (task.endpoint === 'RENAME_PROJECT') {
+            // ★ Rename: update cache + rename on Google Flow
+            const body = typeof task.body === 'string' ? JSON.parse(task.body) : task.body;
+            const oldName = body.oldProjectName || null;
+            const newName = body.newProjectName || null;
+            console.log('[Komfy] RENAME_PROJECT:', oldName, '→', newName);
+
+            if (oldName && newName && oldName !== newName) {
+                // Update projectMap cache
+                const mapData = await new Promise(r => chrome.storage.local.get(['komfyProjectMap'], r));
+                const projectMap = mapData.komfyProjectMap || {};
+                const projectId = projectMap[oldName];
+                if (projectId) {
+                    projectMap[newName] = projectId;
+                    delete projectMap[oldName];
+                    await chrome.storage.local.set({ komfyProjectMap: projectMap });
+                    console.log('[Komfy] RENAME_PROJECT cache updated:', projectId.substring(0, 16));
+
+                    // Rename on Google Flow UI
+                    try {
+                        await renameProjectOnFlow(newName, projectId);
+                        console.log('[Komfy] RENAME_PROJECT ✅ Flow project renamed');
+                    } catch (renameErr) {
+                        console.warn('[Komfy] RENAME_PROJECT Flow rename failed (cache still updated):', renameErr.message?.substring(0, 80));
+                    }
+                    result = { ok: true, status: 200, body: JSON.stringify({ projectId, oldName, newName }) };
+                } else {
+                    console.log('[Komfy] RENAME_PROJECT: old name not in cache, will create on next task');
+                    result = { ok: true, status: 200, body: '{"skipped":"old name not cached"}' };
+                }
+            } else {
+                result = { ok: true, status: 200, body: '{"skipped":"invalid names"}' };
+            }
+
+        } else if (task.endpoint === 'UPLOAD_IMAGE') {
+            // Upload image to Google Flow project
+            // ★ Always verify project + credentials before upload
+            const body = typeof task.body === 'string' ? JSON.parse(task.body) : task.body;
+            const imageBytes = body.imageBytes;
+            if (!imageBytes) throw new Error('UPLOAD_IMAGE: Khong co imageBytes');
+
+            await ensureFlowTab(false, lockProjectName || null);
+            if (!sessionData.bearerToken) {
+                const started = Date.now();
+                while (!sessionData.bearerToken && Date.now() - started < 15000) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                if (!sessionData.bearerToken) {
+                    throw new Error('Khong co Google session token. Vui long mo tab Google Flow va dang nhap.');
+                }
+            }
+            // Use verified projectId from session (not stale body.projectId)
+            const projectId = sessionData.projectId || body.projectId;
+            if (!projectId) throw new Error('UPLOAD_IMAGE: Khong co projectId');
+            console.log('[Komfy] UPLOAD: verified projectId:', projectId.substring(0, 16));
+
+            // ★ CHECK CACHE — skip upload neu anh da co mediaId
+            const cachedId = getCachedMediaId(imageBytes, projectId);
+            if (cachedId) {
+                console.log('[Komfy] Upload CACHE HIT! mediaId:', cachedId.substring(0, 20), '| size:', (imageBytes.length / 1024).toFixed(0), 'KB');
+                result = { ok: true, status: 200, body: JSON.stringify({ media: { name: cachedId } }) };
+            } else {
+                console.log('[Komfy] Upload image | projectId:', projectId, '| size:', (imageBytes.length / 1024).toFixed(0), 'KB');
+
+                const uploadBody = JSON.stringify({
+                    clientContext: {
+                        projectId: projectId,
+                        tool: 'PINHOLE',
+                    },
+                    imageBytes: imageBytes,
+                    isUserUploaded: true,
+                    isHidden: false,
+                    mimeType: 'image/jpeg',
+                    fileName: 'komfy_ingredient.jpg'
+                });
+
+                const FLOW_API = 'https://aisandbox-pa.googleapis.com/v1';
+
+                // Generate fresh reCAPTCHA token
+                const tab = await findFlowTab();
+                if (tab) {
+                    try {
+                        const results = await chrome.scripting.executeScript({
+                            target: { tabId: tab.id },
+                            world: 'MAIN',
+                            func: async () => {
+                                if (window.grecaptcha && window.grecaptcha.enterprise) {
+                                    try { return await window.grecaptcha.enterprise.execute('6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV', { action: 'upload_image' }); } catch(e) { return null; }
+                                }
+                                return null;
+                            }
+                        });
+                        if (results?.[0]?.result) sessionData.xbv = results[0].result;
+                    } catch(e) {}
+                }
+
+                // Human-like pause before upload (simulate user selecting file)
+                await humanDelay(600, 1500);
+
+                let uploadRes = await fetch(FLOW_API + '/flow/uploadImage', {
+                    method: 'POST',
+                    headers: {
+                        'authorization': sessionData.bearerToken || '',
+                        'x-browser-validation': sessionData.xbv || '',
+                        'content-type': 'application/json',
+                        'accept': '*/*',
+                        'origin': 'https://labs.google',
+                        'referer': 'https://labs.google/',
+                    },
+                    body: uploadBody,
+                });
+
+                let uploadText = await uploadRes.text();
+                console.log('[Komfy] Upload response status:', uploadRes.status);
+
+                // ★ RETRY LOGIC FOR STALE CREDENTIALS (401 / 403)
+                if (!uploadRes.ok && (uploadRes.status === 401 || uploadRes.status === 403)) {
+                    console.warn(`[Komfy] Upload failed ${uploadRes.status} (Stale credentials). Forcing reload and retry...`);
+                    // Force refresh tab to get new bearer token
+                    await ensureFlowTab(true, lockProjectName || null); 
+                    await humanDelay(2000, 3000); // Give time for page to settle
+
+                    // Refresh recaptcha using the new tab
+                    const newTab = await findFlowTab();
+                    if (newTab) {
+                        try {
+                            const results = await chrome.scripting.executeScript({
+                                target: { tabId: newTab.id },
+                                world: 'MAIN',
+                                func: async () => {
+                                    if (window.grecaptcha && window.grecaptcha.enterprise) {
+                                        try { return await window.grecaptcha.enterprise.execute('6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV', { action: 'upload_image' }); } catch(e) { return null; }
+                                    }
+                                    return null;
+                                }
+                            });
+                            if (results?.[0]?.result) sessionData.xbv = results[0].result;
+                        } catch(e) {}
+                    }
+
+                    // Retry Fetch
+                    uploadRes = await fetch(FLOW_API + '/flow/uploadImage', {
+                        method: 'POST',
+                        headers: {
+                            'authorization': sessionData.bearerToken || '',
+                            'x-browser-validation': sessionData.xbv || '',
+                            'content-type': 'application/json',
+                            'accept': '*/*',
+                            'origin': 'https://labs.google',
+                            'referer': 'https://labs.google/',
+                        },
+                        body: uploadBody,
+                    });
+                    
+                    uploadText = await uploadRes.text();
+                    console.log('[Komfy] Upload retry response status:', uploadRes.status);
+                }
+
+                if (!uploadRes.ok) {
+                    throw new Error('Upload failed: HTTP ' + uploadRes.status + ' - ' + uploadText.substring(0, 200));
+                }
+
+                // ★ CACHE mediaId tu response
+                try {
+                    const parsed = JSON.parse(uploadText);
+                    const mediaId = parsed?.media?.name || parsed?.mediaId;
+                    if (mediaId) {
+                        setCachedMediaId(imageBytes, projectId, mediaId);
+                        console.log('[Komfy] Upload cached! mediaId:', mediaId.substring(0, 20));
+                    }
+                } catch(e) {}
+
+                result = { ok: true, status: uploadRes.status, body: uploadText };
+            }
+
+        } else if (task.endpoint.includes('batchAsyncGenerateVideoText')) {
+            // Video generation (T2V)
+            // ★ DIRECT API FIRST — khong phu thuoc UI, ngon ngu, layout
+            const videoBody = JSON.parse(task.body);
+            const videoImageInputs = videoBody.imageInputs || [];
+            const videoRefMediaIds = videoBody.referenceMediaIds || [];
+            const hasIngredientImages = videoImageInputs.length > 0;
+            const hasMediaIds = videoRefMediaIds.length > 0;
+
+            // Direct API: ho tro T2V thuan + T2V co ingredient images (qua referenceMediaIds)
+            if (!hasIngredientImages || hasMediaIds) {
+                try {
+                    console.log('[Komfy] Video T2V → trying Direct API first...', hasMediaIds ? `(${videoRefMediaIds.length} mediaIds)` : '(no ingredients)');
+                    result = await directGenerateVideo(task);
+                    console.log('[Komfy] Video T2V ✅ Direct API success!');
+                } catch (directErr) {
+                    const errMsg = directErr.message || String(directErr);
+                    console.warn('[Komfy] Video T2V Direct API failed:', errMsg, '→ fallback to UI automation');
+                    result = null;
+                }
+            }
+
+            if (!result) {
+                // UI automation fallback (hoac ingredient images)
+                const parts = videoBody.requests && videoBody.requests[0] && videoBody.requests[0].textInput &&
+                    videoBody.requests[0].textInput.structuredPrompt && videoBody.requests[0].textInput.structuredPrompt.parts;
+                const prompt = (parts && parts[0] && parts[0].text) || 'A beautiful scene';
+                const aspectRatio = (videoBody.requests[0] && videoBody.requests[0].aspectRatio) ||
+                    (videoBody.requests[0] && videoBody.requests[0].videoGenerationConfig && videoBody.requests[0].videoGenerationConfig.aspectRatio) ||
+                    'VIDEO_ASPECT_RATIO_LANDSCAPE';
+                const pName = videoBody.projectName || (videoBody.clientContext && videoBody.clientContext.projectName) || null;
+                const videoModelKey = (videoBody.requests[0] && videoBody.requests[0].videoModelKey) || null;
+                const targetVideoModel = videoModelKey?.toLowerCase().includes('quality') ? 'Veo 3.1 - Quality'
+                    : videoModelKey?.toLowerCase().includes('lite') ? 'Veo 3.1 - Lite'
+                    : 'Veo 3.1 - Fast';
+                console.log('[Komfy] Video task (UI) | project:', pName, '| aspectRatio:', aspectRatio, '| model:', videoModelKey, '| target:', targetVideoModel, '| ingredients:', videoImageInputs.length, '| prompt:', prompt.substring(0, 40));
+                result = await generateViaUI(prompt, aspectRatio, pName, videoModelKey, null, targetVideoModel, 'Ingredients', videoImageInputs, task.requestId);
+            }
+
+        } else if (task.endpoint.includes('batchAsyncGenerateVideoStartImage') ||
+                   task.endpoint.includes('batchAsyncGenerateVideoEndImage') ||
+                   task.endpoint.includes('batchAsyncGenerateVideoStartAndEndImage')) {
+            // I2V / Last Frame / Interpolation
+            // ★ DIRECT API FIRST — I2V co startImage/endImage mediaId trong body
+            const i2vBody = JSON.parse(task.body);
+            const hasMediaId = !!(i2vBody.requests?.[0]?.startImage?.mediaId || i2vBody.requests?.[0]?.endImage?.mediaId);
+
+            // ★ DEBUG: Full I2V data trace at entry point
+            console.log('[Komfy] [DEBUG] I2V task entry:',
+                '| hasMediaId:', hasMediaId,
+                '| startImage:', JSON.stringify(i2vBody.requests?.[0]?.startImage || null),
+                '| endImage:', JSON.stringify(i2vBody.requests?.[0]?.endImage || null),
+                '| startFrameDataUrl:', i2vBody.startFrameDataUrl ? 'YES(' + i2vBody.startFrameDataUrl.length + ' chars)' : 'null',
+                '| endFrameDataUrl:', i2vBody.endFrameDataUrl ? 'YES(' + i2vBody.endFrameDataUrl.length + ' chars)' : 'null',
+                '| videoModelKey:', i2vBody.requests?.[0]?.videoModelKey
+            );
+
+            if (hasMediaId) {
+                try {
+                    console.log('[Komfy] I2V → trying Direct API first...');
+                    result = await directGenerateVideo(task);
+                    console.log('[Komfy] I2V ✅ Direct API success!');
+                } catch (directErr) {
+                    console.warn('[Komfy] I2V Direct API failed:', directErr.message, '→ fallback to UI automation');
+                    result = null;
+                }
+            }
+
+            if (!result) {
+                // UI automation fallback
+                // Extract params truoc de dung cho ensureFlowTab
+                const prompt = i2vBody.requests?.[0]?.textInput?.structuredPrompt?.parts?.[0]?.text || 'A beautiful scene';
+                const aspectRatio = i2vBody.uiAspectRatio || i2vBody.requests?.[0]?.aspectRatio || '16:9';
+                const resolutionMultiplier = i2vBody.resolutionMultiplier || 'x1';
+                const pName = i2vBody.projectName || null;
+                const videoModelKey = i2vBody.requests?.[0]?.videoModelKey || null;
+
+                if (!sessionData.bearerToken) {
+                    // ★ Goi ensureFlowTab VOI project name de navigate toi project + capture credentials
+                    console.log('[Komfy] I2V: Chua co token → ensureFlowTab (project:', pName, ')...');
+                    await ensureFlowTab(false, pName);
+                    const started = Date.now();
+                    while (!sessionData.bearerToken && Date.now() - started < 15000) {
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+                    if (!sessionData.bearerToken) {
+                        throw new Error('Khong co Google session token. Vui long mo tab Google Flow va dang nhap.');
+                    }
+                }
+
+                const targetVideoModel2 = i2vBody.targetVideoModel
+                    || (videoModelKey?.toLowerCase().includes('quality') ? 'Veo 3.1 - Quality'
+                    : videoModelKey?.toLowerCase().includes('lite') ? 'Veo 3.1 - Lite'
+                    : 'Veo 3.1 - Fast');
+                const videoType2 = (i2vBody.requests[0]?.startImage || i2vBody.requests[0]?.endImage) ? 'Frames' : 'Ingredients';
+
+                const i2vPayload = {
+                    endpoint: task.endpoint,
+                    startImage: i2vBody.requests[0]?.startImage?.mediaId || null,
+                    startCrop: i2vBody.requests[0]?.startImage?.cropCoordinates || null,
+                    endImage: i2vBody.requests[0]?.endImage?.mediaId || null,
+                    endCrop: i2vBody.requests[0]?.endImage?.cropCoordinates || null,
+                    startImageDataUrl: i2vBody.startFrameDataUrl || null,
+                    endImageDataUrl: i2vBody.endFrameDataUrl || null,
+                    videoModelKey: videoModelKey,
+                    aspectRatio: aspectRatio  // ★ 9:16, 16:9 — cần cho auto-crop
+                };
+
+                console.log('[Komfy] I2V task via UI | endpoint:', task.endpoint, '| model:', targetVideoModel2, '| type:', videoType2, '| aspect:', aspectRatio, '| res:', resolutionMultiplier);
+                result = await generateViaUI(prompt, aspectRatio, pName, videoModelKey, i2vPayload, targetVideoModel2, videoType2, i2vBody.imageInputs || [], task.requestId, resolutionMultiplier);
+            }
+
+
+        } else if (task.endpoint === 'chatgptGenerateImage') {
+            const body = typeof task.body === 'string' ? JSON.parse(task.body) : task.body;
+            // Prepend instruction to create image if not explicit
+            const prompt = `Tạo hình ảnh: ${body.prompt || 'A beautiful image'}`;
+            const aspectRatio = body.aspectRatio || '1:1';
+            const imageInputs = body.imageInputs || []; // reference images (base64 data URLs)
+            
+            // Đảm bảo có tab ChatGPT
+            let tabId = sessionData.chatgptSession ? sessionData.chatgptSession.tabId : null;
+
+            if (tabId) {
+                try {
+                    await chrome.tabs.get(tabId);
+                } catch (e) {
+                    tabId = null; // Tab closed
+                }
+            }
+
+            if (!tabId) {
+                const tabs = await chrome.tabs.query({});
+                const gptTab = tabs.find(t => t.url && t.url.includes('chatgpt.com'));
+                if (gptTab) {
+                    tabId = gptTab.id;
+                } else {
+                    console.log('[Komfy] Opening new ChatGPT tab...');
+                    const newTab = await chrome.tabs.create({ url: 'https://chatgpt.com/', active: true });
+                    tabId = newTab.id;
+                    await new Promise(res => setTimeout(res, 8000)); // wait for load
+                }
+            }
+
+            sessionData.chatgptSession = { tabId: tabId };
+            
+            // Đảm bảo focus tab
+            await chrome.tabs.update(tabId, { active: true });
+            const tabInfo = await chrome.tabs.get(tabId);
+            await chrome.windows.update(tabInfo.windowId, { focused: true });
+            await new Promise(res => setTimeout(res, 500)); // wait for focus to settle
+
+
+            // Tiêm content script
+            await chrome.scripting.executeScript({
+                target: { tabId: tabId },
+                files: ['modules/chatgpt-isolated.js'],
+                world: 'ISOLATED'
+            }).catch(e => console.warn('[Komfy] Inject chatgpt script error:', e.message));
+            
+            console.log('[Komfy] Sending GENERATE_IMAGE_CHATGPT to tab', tabId);
+            const response = await new Promise((resolve, reject) => {
+                chrome.tabs.sendMessage(tabId, { action: 'GENERATE_IMAGE_CHATGPT', prompt: prompt, aspectRatio: aspectRatio, imageInputs: imageInputs }, (res) => {
+                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    if (!res) return reject(new Error('Không có phản hồi từ tab ChatGPT'));
+                    resolve(res);
+                });
+            });
+            
+            if (response.ok && response.imageUrl) {
+                console.log('[Komfy] Lấy ảnh thành công từ ChatGPT:', response.imageUrl);
+                // Download ảnh sang base64 để trả về Studio
+                const fetchRes = await fetch(response.imageUrl);
+                if (!fetchRes.ok) throw new Error('Không thể download ảnh từ ChatGPT');
+                const buf = await fetchRes.arrayBuffer();
+                const u8 = new Uint8Array(buf);
+                let b = ''; const C = 8192;
+                for (let i = 0; i < u8.length; i += C) b += String.fromCharCode.apply(null, u8.subarray(i, i + C));
+                const b64 = btoa(b);
+                const mime = fetchRes.headers.get('content-type') || 'image/webp';
+                
+                result = { ok: true, status: 200, body: JSON.stringify({ imageUrl: `data:${mime};base64,${b64}` }) };
+            } else {
+                throw new Error('ChatGPT Error: ' + response.error);
+            }
+        } else if (task.endpoint === 'grokSubmitVideo') {            // ═══ GROK VIDEO SUBMIT (DOM Automation Fallback) ═══
+            // Cloudflare WAF blocks raw fetch API calls (403 Forbidden).
+            // We use DOM simulation to type the prompt and click generate.
+            // Once the URL changes to /post/{videoId}, we capture it and return.
+            const body = typeof task.body === 'string' ? JSON.parse(task.body) : task.body;
+            const prompt = body.prompt || 'A beautiful video';
+            const grokDuration = parseInt(body.duration, 10) || 6;
+            const grokAspectRatio = body.aspectRatio || '16:9';
+            const grokResolution = body.resolution || '720p';
+            const grokStartImage = body.startImage || null;
+            const grokFileId = body.fileId || null;
+            const taskRequestId = task.requestId || null;
+
+            // ── Step 1: Prepare Tab & Clean State ──
+            let grokTabId = null;
+            const tabs = await chrome.tabs.query({ url: '*://*.grok.com/*' });
+            if (tabs.length > 0) {
+                const gTab = tabs.find(t => !t.url.includes('/login')) || tabs[0];
+                grokTabId = gTab.id;
+                await chrome.tabs.update(grokTabId, { active: true });
+                try { await chrome.windows.update(gTab.windowId, { focused: true }); } catch(e){}
+
+                // Hard-navigate to /imagine to ensure clean React state for every run
+                await chrome.scripting.executeScript({
+                    target: { tabId: grokTabId }, world: 'MAIN',
+                    func: () => {
+                        if (!window.location.pathname.endsWith('/imagine') || window.location.pathname.includes('/post/')) {
+                            console.log('[Komfy] Resetting to /imagine via href');
+                            window.location.href = 'https://grok.com/imagine';
+                        }
+                    }
+                });
+                await new Promise(r => setTimeout(r, 4000)); // Wait for page to fully load
+            } else {
+                const newTab = await chrome.tabs.create({ url: 'https://grok.com/imagine', active: true });
+                grokTabId = newTab.id;
+                await new Promise(r => setTimeout(r, 8000));
+            }
+
+            // ── Step 2: DOM Automation (Type & Submit) ──
+            console.log('[Komfy Grok Submit] Automating UI... prompt:', prompt.substring(0, 50));
+            const execResults = await chrome.scripting.executeScript({
+                target: { tabId: grokTabId }, world: 'MAIN',
+                func: async (promptText, grokFileId, grokAspectRatio, grokDuration, grokResolution, taskRequestId) => {
+                    try {
+                        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+                        // 1. Set Video Parameters (Resolution, Duration, Aspect Ratio)
+                        const setParams = async () => {
+                            const accessibleClick = async (elem) => {
+                                if (!elem) return;
+                                elem.focus();
+                                await sleep(50);
+                                elem.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                                elem.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, bubbles: true }));
+                                elem.click();
+                            };
+
+                            // Helper to click radio buttons inside radiogroups
+                            const clickRadio = async (groupLabel, valueStr) => {
+                                const group = document.querySelector(`div[aria-label="${groupLabel}"]`);
+                                if (group) {
+                                    const btn = Array.from(group.querySelectorAll('button[role="radio"]'))
+                                        .find(b => b.textContent.includes(valueStr));
+                                    if (btn && btn.getAttribute('aria-checked') !== 'true') {
+                                        console.log(`[Komfy] Clicking radio: ${groupLabel} -> ${valueStr}`);
+                                        await accessibleClick(btn);
+                                    } else if (btn) {
+                                        console.log(`[Komfy] Radio already selected: ${groupLabel} -> ${valueStr}`);
+                                    } else {
+                                        console.warn(`[Komfy] Radio option ${valueStr} not found in ${groupLabel}`);
+                                    }
+                                } else {
+                                    console.warn(`[Komfy] Group ${groupLabel} not found`);
+                                }
+                            };
+
+                            // Ensure Generation Mode is "Video"
+                            await clickRadio('Generation mode', 'Video');
+                            await sleep(300);
+
+                            // Set Resolution (720p or 480p)
+                            await clickRadio('Video resolution', grokResolution);
+                            await sleep(200);
+
+                            // Set Duration (6s or 10s)
+                            await clickRadio('Video duration', grokDuration + 's');
+                            await sleep(200);
+
+                            // Set Aspect Ratio (Dropdown menu)
+                            const arBtn = document.querySelector('button[aria-label="Aspect Ratio"]');
+                            if (arBtn && !arBtn.textContent.includes(grokAspectRatio)) {
+                                console.log(`[Komfy] Opening Aspect Ratio dropdown to select ${grokAspectRatio}`);
+                                await accessibleClick(arBtn); // Open dropdown
+                                await sleep(400); // Wait for Radix menu animation
+                                
+                                // Radix portals the menu to the end of document.body
+                                const options = document.querySelectorAll('[role="menuitem"], [role="option"]');
+                                const targetOption = Array.from(options).find(opt => opt.textContent.includes(grokAspectRatio));
+                                if (targetOption) {
+                                    console.log(`[Komfy] Clicking Aspect Ratio option: ${grokAspectRatio}`);
+                                    await accessibleClick(targetOption);
+                                } else {
+                                    console.warn(`[Komfy] Aspect Ratio option ${grokAspectRatio} not found in dropdown!`);
+                                    // Try to close dropdown
+                                    document.body.click();
+                                }
+                                await sleep(200);
+                            } else if (arBtn) {
+                                console.log(`[Komfy] Aspect Ratio already selected: ${grokAspectRatio}`);
+                            } else {
+                                console.warn('[Komfy] Aspect Ratio button not found');
+                            }
+                        };
+                        await setParams();
+
+                        // 2. Intercept fetch to reliably grab userId from API response
+                        window._komfyUserId = window._komfyUserId || null;
+                        if (!window._komfyFetchIntercepted) {
+                            window._komfyFetchIntercepted = true;
+                            const originalFetch = window.fetch;
+                            window.fetch = async (...args) => {
+                                const resp = await originalFetch(...args);
+                                try {
+                                    const clone = resp.clone();
+                                    clone.json().then(data => {
+                                        if (data?.post?.userId) window._komfyUserId = data.post.userId;
+                                        if (data?.userId) window._komfyUserId = data.userId;
+                                    }).catch(()=>{});
+                                } catch (e) {}
+                                return resp;
+                            };
+                        }
+
+                        // 3. Find Textarea (Grok uses TipTap ProseMirror)
+                        let editor = document.querySelector('.ProseMirror');
+                        if (!editor) return { error: 'Grok ProseMirror editor not found' };
+
+                        // 4. Focus and Type
+                        editor.focus();
+                        
+                        // Use execCommand to simulate actual typing so ProseMirror's internal state updates
+                        document.execCommand('selectAll', false, null);
+                        document.execCommand('insertText', false, promptText);
+                        await sleep(500);
+
+                        // 5. Find and Click Submit Button
+                        let submitBtn = document.querySelector('button[aria-label="Submit"]');
+                        if (!submitBtn) submitBtn = document.querySelector('button[type="submit"]');
+                        
+                        if (!submitBtn || submitBtn.disabled) {
+                            editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                        } else {
+                            submitBtn.click();
+                        }
+
+                        // 6. Wait for URL to change to /post/{videoId} and for userId to be intercepted
+                        const startTime = Date.now();
+                        while (Date.now() - startTime < 15000) {
+                            await sleep(500);
+                            const currentUrl = window.location.href;
+                            if (currentUrl.includes('/post/')) {
+                                const parts = currentUrl.split('/');
+                                const videoId = parts[parts.length - 1];
+                                
+                                let userId = window._komfyUserId || 'unknown';
+                                
+                                // Fallback: try to extract from DOM if fetch interception missed it
+                                if (userId === 'unknown') {
+                                    const match = document.documentElement.innerHTML.match(/assets\.grok\.com\/users\/([a-f0-9\-]{36})/);
+                                    if (match) userId = match[1];
+                                }
+
+                                return { videoId, userId };
+                            }
+                        }
+
+                        return { error: 'Timeout waiting for Grok to navigate to /post/{videoId}' };
+
+                    } catch (e) {
+                        return { error: 'DOM Automation exception: ' + e.message };
+                    }
+                },
+                args: [prompt, grokFileId, grokAspectRatio, grokDuration, grokResolution, taskRequestId],
+            });
+
+            const domResult = execResults?.[0]?.result;
+            console.log('[Komfy Grok Submit] DOM Result:', JSON.stringify(domResult));
+
+            if (domResult?.error) throw new Error(domResult.error);
+
+            // ── Step 3: Extract User ID if unknown ──
+            let finalUserId = domResult.userId;
+            if (finalUserId && finalUserId !== 'unknown') {
+                sessionData.grokUserId = finalUserId; // Cache it dynamically for future use
+            } else if (sessionData.grokUserId) {
+                finalUserId = sessionData.grokUserId;
+            } else {
+                throw new Error("Không thể trích xuất userId tự động từ giao diện Grok. Vui lòng tải lại trang.");
+            }
+
+            console.log('[Komfy Grok Submit] ✅ DOM Automation success! videoId:', domResult.videoId);
+
+            // Return videoId + userId immediately — Electron will poll for completion
+            result = {
+                ok: true, status: 200,
+                body: JSON.stringify({
+                    videoId: domResult.videoId,
+                    userId: finalUserId,
+                    videoUrl: `https://assets.grok.com/users/${finalUserId}/generated/${domResult.videoId}/generated_video.mp4`,
+                }),
+            };
+
+
+        } else if (task.endpoint === 'grokGenerateVideo') {
+            // ═══ GROK VIDEO GENERATION — LEGACY BLOCKING MODE (backup) ═══
+            // API calls run IN the grok.com page context → session cookies included automatically
+            const body = typeof task.body === 'string' ? JSON.parse(task.body) : task.body;
+            const prompt = body.prompt || 'A beautiful video';
+            const grokDuration = parseInt(body.duration, 10) || 6;
+            const grokAspectRatio = body.aspectRatio || '16:9';
+            const grokResolution = body.resolution || '720p';
+            const grokStartImage = body.startImage || null; // base64 data URL for I2V
+
+            // ── Step 1: Find or open grok.com tab ──
+            let grokTabId = null;
+            const tabs = await chrome.tabs.query({ url: '*://*.grok.com/*' });
+            if (tabs.length > 0) {
+                const gTab = tabs.find(t => t.active && !t.url.includes('/login')) || tabs.find(t => !t.url.includes('/login')) || tabs[0];
+                console.log(`[Komfy Grok] Using existing tab: ${gTab.id} (${gTab.url})`);
+                grokTabId = gTab.id;
+                
+                // Force bring tab to front so the user can see it!
+                await chrome.tabs.update(grokTabId, { active: true });
+                try { await chrome.windows.update(gTab.windowId, { focused: true }); } catch(e){}
+
+                // ── Step 1.5: Navigate away from /post/ to avoid mixing results ──
+                // After a previous generation, the tab stays on /imagine/post/{id}
+                // which causes subsequent generations to conflict with old results.
+                if (gTab.url && gTab.url.includes('/post/')) {
+                    console.log('[Komfy Grok] Tab is on /post/ — navigating to /imagine/saved for clean state');
+                    await chrome.tabs.update(grokTabId, { url: 'https://grok.com/imagine/saved' });
+                    // Wait for page to finish loading
+                    await new Promise(resolve => {
+                        const onUpdated = (tabId, changeInfo) => {
+                            if (tabId === grokTabId && changeInfo.status === 'complete') {
+                                chrome.tabs.onUpdated.removeListener(onUpdated);
+                                resolve();
+                            }
+                        };
+                        chrome.tabs.onUpdated.addListener(onUpdated);
+                        // Safety timeout: don't wait forever
+                        setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); }, 10000);
+                    });
+                    await new Promise(r => setTimeout(r, 2000)); // Extra settle time
+                    console.log('[Komfy Grok] Navigated to /imagine/saved ✅');
+                }
+            } else {
+                console.log('[Komfy Grok] Opening new grok.com tab...');
+                const newTab = await chrome.tabs.create({ url: 'https://grok.com/imagine', active: true });
+                grokTabId = newTab.id;
+                // Wait for page to load past Cloudflare
+                await new Promise(res => setTimeout(res, 12000));
+            }
+            sessionData.grokSession = { tabId: grokTabId };
+            console.log('[Komfy Grok] Using tab:', grokTabId);
+
+            // ── Step 2: Upload start image if I2V ──
+            let grokFileId = null;
+            if (grokStartImage && grokStartImage.startsWith('data:')) {
+                console.log('[Komfy Grok] I2V mode: uploading start image...');
+                const uploadResults = await chrome.scripting.executeScript({
+                    target: { tabId: grokTabId },
+                    world: 'MAIN',
+                    func: async (imageDataUrl) => {
+                        try {
+                            const [header, b64] = imageDataUrl.split(',');
+                            const mime = header.match(/:(.*?);/)?.[1] || 'image/jpeg';
+                            const ext = mime.includes('png') ? 'png' : 'jpg';
+                            const fileName = `komfy_${Date.now()}.${ext}`;
+
+                            const res = await fetch('https://grok.com/rest/app-chat/upload-file', {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: { 'content-type': 'application/json' },
+                                body: JSON.stringify({
+                                    fileName,
+                                    fileMimeType: mime,
+                                    fileSource: 'IMAGINE_SELF_UPLOAD_FILE_SOURCE',
+                                    content: b64,
+                                }),
+                            });
+
+                            if (!res.ok) {
+                                const errText = await res.text().catch(() => '');
+                                return { error: `Upload failed: HTTP ${res.status} - ${errText.substring(0, 200)}` };
+                            }
+
+                            const data = await res.json();
+                            const fileId = data?.fileMetadata?.fileId || data?.fileId || data?.id;
+                            if (!fileId) {
+                                return { error: 'Upload OK but no fileId. Response: ' + JSON.stringify(data).substring(0, 200) };
+                            }
+                            return { fileId };
+                        } catch (e) {
+                            return { error: 'Upload exception: ' + e.message };
+                        }
+                    },
+                    args: [grokStartImage],
+                });
+
+                const uploadResult = uploadResults?.[0]?.result;
+                if (uploadResult?.error) throw new Error(uploadResult.error);
+                grokFileId = uploadResult?.fileId;
+                console.log('[Komfy Grok] Upload done! fileId:', grokFileId);
+            }
+
+            // ── Step 2.5: Extract anti-bot headers from grok.com page ──
+            console.log('[Komfy Grok] Extracting page headers...');
+            const headerResults = await chrome.scripting.executeScript({
+                target: { tabId: grokTabId },
+                world: 'MAIN',
+                func: () => {
+                    try {
+                        const headers = {};
+
+                        // 1. Extract cookies (for CSRF tokens)
+                        const cookies = document.cookie;
+                        // Look for common CSRF cookie patterns
+                        const cookieObj = {};
+                        cookies.split(';').forEach(c => {
+                            const [k, ...v] = c.trim().split('=');
+                            if (k) cookieObj[k.trim()] = v.join('=');
+                        });
+
+                        // 2. Extract meta tags
+                        const metaCsrf = document.querySelector('meta[name="csrf-token"]')?.content
+                            || document.querySelector('meta[name="_csrf"]')?.content;
+                        if (metaCsrf) headers['x-csrf-token'] = metaCsrf;
+
+                        // 3. Try to find __NEXT_DATA__ or window state for auth tokens
+                        if (window.__NEXT_DATA__) {
+                            const nd = window.__NEXT_DATA__;
+                            // Look for session/auth data
+                            const props = nd.props?.pageProps;
+                            if (props?.csrfToken) headers['x-csrf-token'] = props.csrfToken;
+                        }
+
+                        // 4. Try to intercept existing fetch to see what headers are used
+                        // Hook into the original fetch temporarily
+                        const capturedHeaders = {};
+                        if (window.__komfyCapturedGrokHeaders) {
+                            Object.assign(capturedHeaders, window.__komfyCapturedGrokHeaders);
+                        }
+
+                        // 5. Check for any x-* headers in performance entries (Resource Timing API)
+                        // This won't show request headers but can confirm API patterns
+
+                        // 6. Return all cookies + detected headers
+                        return {
+                            cookies: cookieObj,
+                            headers: { ...headers, ...capturedHeaders },
+                            hasSession: !!(cookies.includes('sso') || cookies.includes('auth') || cookies.includes('ct0')),
+                            cookieKeys: Object.keys(cookieObj),
+                        };
+                    } catch (e) {
+                        return { error: e.message, cookies: {}, headers: {} };
+                    }
+                },
+            });
+
+            const headerData = headerResults?.[0]?.result || {};
+            console.log('[Komfy Grok] Page state — hasSession:', headerData.hasSession, '| cookieKeys:', headerData.cookieKeys?.join(','), '| headers:', JSON.stringify(headerData.headers));
+
+            // ── Step 2.8: Start background DOM progress poller ──
+            // Polls the grok.com page every 3s for the progress % span element
+            // and reports it to FlowBroker. Runs in parallel with the API streaming call.
+            const taskRequestId = task.requestId || null;
+            let _domProgressInterval = null;
+            if (taskRequestId) {
+                _domProgressInterval = setInterval(async () => {
+                    try {
+                        const pollResults = await chrome.scripting.executeScript({
+                            target: { tabId: grokTabId },
+                            world: 'MAIN',
+                            func: () => {
+                                // Look for: <span class="...tabular-nums animate-pulse">85%</span>
+                                const spans = document.querySelectorAll('span.tabular-nums');
+                                for (const span of spans) {
+                                    const text = span.textContent.trim();
+                                    const match = text.match(/^(\d+)%$/);
+                                    if (match) return { percent: parseInt(match[1], 10) };
+                                }
+                                // Fallback: any span with animate-pulse containing %
+                                const pulseSpans = document.querySelectorAll('span.animate-pulse');
+                                for (const span of pulseSpans) {
+                                    const match = span.textContent.trim().match(/^(\d+)%$/);
+                                    if (match) return { percent: parseInt(match[1], 10) };
+                                }
+                                return null;
+                            },
+                        });
+                        const domProgress = pollResults?.[0]?.result;
+                        if (domProgress && typeof domProgress.percent === 'number') {
+                            console.log('[Komfy Grok] DOM progress:', domProgress.percent + '%');
+                            await fetch('http://127.0.0.1:3120/api/internal/gen-progress', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    requestId: taskRequestId,
+                                    percent: domProgress.percent,
+                                    message: `🎬 Đang tạo video Grok... ${domProgress.percent}%`,
+                                }),
+                            }).catch(() => {});
+                        }
+                    } catch (_) {
+                        // Tab may have navigated or closed — ignore silently
+                    }
+                }, 3000);
+            }
+
+            // ── Step 3: Generate video via internal API (MAIN world) ──
+            // Step 3a: Create media post (T2V only — gets parentPostId)
+            // Step 3b: POST /conversations/new with streaming response
+            const bgGrokHeaders = sessionData.grokHeaders || {};
+            console.log('[Komfy Grok] Generating video... prompt:', prompt.substring(0, 50));
+            const genResults = await chrome.scripting.executeScript({
+                target: { tabId: grokTabId },
+                world: 'MAIN',
+                func: async (prompt, fileId, aspectRatio, duration, resolution, bgHeaders, brokerRequestId) => {
+                    try {
+                        const ASSETS_BASE = 'https://assets.grok.com/';
+                        const origFetch = window.__komfyOrigFetch || window.fetch;
+                        const gFetch = (url, opts = {}) => origFetch.call(window, url, {
+                            ...opts, credentials: 'include',
+                            headers: { 'content-type': 'application/json', ...bgHeaders, ...(opts.headers || {}) },
+                        });
+
+                        // Helper: report progress to FlowBroker
+                        const reportProgress = (percent, message) => {
+                            if (!brokerRequestId) return;
+                            origFetch.call(window, 'http://127.0.0.1:3120/api/internal/gen-progress', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ requestId: brokerRequestId, percent, message }),
+                            }).catch(() => {});
+                        };
+
+                        // ── Step 3a: Create parentPostId (T2V) ──
+                        let parentPostId = fileId; // I2V: fileId IS the parentPostId
+                        if (!fileId) {
+                            console.log('[Komfy Grok] Creating media post...');
+                            reportProgress(1, '📝 Tạo media post...');
+                            const postRes = await gFetch('https://grok.com/rest/media/post/create', {
+                                method: 'POST',
+                                body: JSON.stringify({ mediaType: 'MEDIA_POST_TYPE_VIDEO', prompt }),
+                            });
+                            if (!postRes.ok) {
+                                const t = await postRes.text().catch(() => '');
+                                return { error: `post/create failed: HTTP ${postRes.status} - ${t.substring(0, 200)}` };
+                            }
+                            const postData = await postRes.json();
+                            parentPostId = postData?.post?.id;
+                            if (!parentPostId) return { error: 'post/create: no post.id. ' + JSON.stringify(postData).substring(0, 200) };
+                            console.log('[Komfy Grok] parentPostId:', parentPostId);
+                        }
+
+                        // ── Step 3b: conversations/new (streaming) ──
+                        reportProgress(2, '🎬 Bắt đầu tạo video...');
+                        const reqBody = {
+                            temporary: true,
+                            modelName: 'imagine-video-gen',
+                            message: `${prompt} --mode=custom`,
+                            enableSideBySide: true,
+                            responseMetadata: {
+                                experiments: [],
+                                modelConfigOverride: { modelMap: { videoGenModelConfig: {
+                                    parentPostId, aspectRatio,
+                                    videoLength: duration,
+                                    resolutionName: resolution,
+                                }}}
+                            }
+                        };
+                        if (fileId) reqBody.fileAttachments = [fileId];
+
+                        console.log('[Komfy Grok] POST /conversations/new | parentPostId:', parentPostId);
+                        const res = await gFetch('https://grok.com/rest/app-chat/conversations/new', {
+                            method: 'POST', body: JSON.stringify(reqBody),
+                        });
+                        if (!res.ok) {
+                            const t = await res.text().catch(() => '');
+                            return { error: `Gen failed: HTTP ${res.status} - ${t.substring(0, 300)}` };
+                        }
+
+                        // Parse newline-delimited JSON stream (NOT SSE)
+                        // Grok concatenates JSON objects: {...}{...}{...}
+                        const reader = res.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buffer = '';
+                        let videoUrl = null;
+                        let lastProgress = 0;
+                        let lastError = null;
+                        let debugChunks = [];
+
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            buffer += decoder.decode(value, { stream: true });
+
+                            // Split concatenated JSON: }{ → }\n{
+                            const normalized = buffer.replace(/\}\s*\{/g, '}\n{');
+                            const parts = normalized.split('\n');
+                            buffer = parts.pop() || '';
+
+                            for (const part of parts) {
+                                const trimmed = part.trim();
+                                if (!trimmed) continue;
+                                debugChunks.push(trimmed.substring(0, 150));
+                                try {
+                                    const data = JSON.parse(trimmed);
+                                    const svr = data?.result?.response?.streamingVideoGenerationResponse;
+                                    if (svr) {
+                                        if (typeof svr.progress === 'number') {
+                                            lastProgress = svr.progress;
+                                            reportProgress(svr.progress, `🎬 Đang tạo video Grok... ${svr.progress}%`);
+                                            console.log('[Komfy Grok] Progress:', svr.progress + '%');
+                                        }
+                                        // At progress=100, videoUrl appears (relative path)
+                                        if (svr.videoUrl) {
+                                            videoUrl = svr.videoUrl.startsWith('http') ? svr.videoUrl : ASSETS_BASE + svr.videoUrl;
+                                            console.log('[Komfy Grok] ✅ Video URL:', videoUrl.substring(0, 80));
+                                        }
+                                    }
+                                    if (data.error) lastError = data.error;
+                                } catch (_) {}
+                            }
+                        }
+                        // Process remaining buffer
+                        if (buffer.trim()) {
+                            try {
+                                const data = JSON.parse(buffer.trim());
+                                const svr = data?.result?.response?.streamingVideoGenerationResponse;
+                                if (svr?.videoUrl) {
+                                    videoUrl = svr.videoUrl.startsWith('http') ? svr.videoUrl : ASSETS_BASE + svr.videoUrl;
+                                }
+                            } catch (_) {}
+                        }
+
+                        if (videoUrl) { reportProgress(100, '✅ Video tạo xong!'); return { videoUrl }; }
+                        if (lastError) return { error: 'Grok error: ' + JSON.stringify(lastError) };
+                        return { error: 'No video URL found. Last progress: ' + lastProgress + '%. Debug: ' + debugChunks.slice(-3).join(' | ') };
+                    } catch (e) {
+                        return { error: 'Gen exception: ' + e.message };
+                    }
+                },
+                args: [prompt, grokFileId, grokAspectRatio, grokDuration, grokResolution, bgGrokHeaders, taskRequestId],
+            });
+
+            // ── Stop DOM progress poller ──
+            if (_domProgressInterval) {
+                clearInterval(_domProgressInterval);
+                _domProgressInterval = null;
+            }
+
+            const genResult = genResults?.[0]?.result;
+            console.log('[Komfy Grok] Gen result:', JSON.stringify(genResult)?.substring(0, 300));
+
+            let finalVideoUrl = genResult?.videoUrl;
+
+            // ── Step 4: DOM Automation Fallback ──
+            if (genResult?.error) {
+                console.warn('[Komfy Grok] Internal API failed:', genResult.error);
+                console.log('[Komfy Grok] Strategy 2: Running DOM automation fallback...');
+                
+                const domFallbackResults = await chrome.scripting.executeScript({
+                    target: { tabId: grokTabId },
+                    world: 'MAIN',
+                    func: async (promptText, targetRes, targetDur, targetAr) => {
+                        try {
+                            const sleep = ms => new Promise(r => setTimeout(r, ms));
+                            
+                            // Radix UI menus often ignore standard .click() and require pointer/mouse events
+                            const reactClick = (element) => {
+                                if (!element) return;
+                                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+                                    element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                                });
+                            };
+
+                            console.log('[Komfy Grok] 1. Starting DOM fallback with settings:', { targetRes, targetDur, targetAr, promptText });
+                            
+                            // Ensure we're on the imagine page
+                            if (!window.location.pathname.includes('/imagine')) {
+                                console.log('[Komfy Grok] Navigating to /imagine');
+                                window.history.pushState({}, '', '/imagine');
+                                window.dispatchEvent(new Event('popstate'));
+                                await sleep(3000);
+                            }
+
+                            // Find the prompt textarea (very specific selector)
+                            const textarea = document.querySelector('[data-testid="chat-input"] .ProseMirror') || 
+                                              document.querySelector('.tiptap, .ProseMirror') ||
+                                              document.querySelector('[contenteditable="true"]');
+
+                            if (!textarea) {
+                                console.log('[Komfy Grok] Error: Textarea not found');
+                                return { error: 'Prompt input not found on grok.com/imagine' };
+                            }
+
+                            // 1. Ensure "Video" mode is selected
+                            const videoToggle = Array.from(document.querySelectorAll('button[role="radio"]')).find(b => b.textContent.trim().toLowerCase() === 'video');
+                            if (videoToggle && videoToggle.getAttribute('aria-checked') !== 'true') {
+                                console.log('[Komfy Grok] Switching to Video mode');
+                                reactClick(videoToggle);
+                                await sleep(500);
+                            }
+
+                            // 1.1 Select Resolution
+                            if (targetRes) {
+                                const resToggle = Array.from(document.querySelectorAll('div[aria-label="Video resolution"] button[role="radio"]')).find(b => b.textContent.includes(targetRes));
+                                if (resToggle && resToggle.getAttribute('aria-checked') !== 'true') {
+                                    console.log('[Komfy Grok] Selecting Resolution:', targetRes);
+                                    reactClick(resToggle);
+                                    await sleep(200);
+                                }
+                            }
+                            
+                            // 1.2 Select Duration
+                            if (targetDur) {
+                                const durToggle = Array.from(document.querySelectorAll('div[aria-label="Video duration"] button[role="radio"]')).find(b => b.textContent.includes(targetDur));
+                                if (durToggle && durToggle.getAttribute('aria-checked') !== 'true') {
+                                    console.log('[Komfy Grok] Selecting Duration:', targetDur);
+                                    reactClick(durToggle);
+                                    await sleep(200);
+                                }
+                            }
+                            
+                            // 1.3 Select Aspect Ratio
+                            if (targetAr) {
+                                const arBtn = document.querySelector('button[aria-label="Aspect Ratio"]');
+                                if (arBtn) {
+                                    const currentAr = arBtn.textContent.trim();
+                                    if (!currentAr.includes(targetAr)) {
+                                        console.log('[Komfy Grok] Changing Aspect Ratio to:', targetAr);
+                                        reactClick(arBtn);
+                                        await sleep(800); // Wait for Radix UI portal to render
+                                        
+                                        // Radix menu items have role="menuitemradio", "menuitem", or "option"
+                                        const roles = Array.from(document.querySelectorAll('[role]'));
+                                        const targetItem = roles.find(item => {
+                                            const role = item.getAttribute('role') || '';
+                                            const isMenuRole = role.includes('menuitem') || role.includes('option') || role.includes('radio');
+                                            return isMenuRole && item.textContent && item.textContent.includes(targetAr);
+                                        });
+                                        
+                                        if (targetItem) {
+                                            console.log('[Komfy Grok] Found AR dropdown item, clicking it via reactClick');
+                                            reactClick(targetItem);
+                                            await sleep(500);
+                                        } else {
+                                            console.log('[Komfy Grok] AR dropdown item not found, closing menu via body click');
+                                            reactClick(document.body);
+                                        }
+                                    } else {
+                                        console.log('[Komfy Grok] Aspect Ratio already correct:', currentAr);
+                                    }
+                                }
+                            }
+
+                            // 2. Type prompt
+                            console.log('[Komfy Grok] 2. Typing prompt');
+                            textarea.focus();
+                            if (textarea.tagName === 'TEXTAREA' || textarea.tagName === 'INPUT') {
+                                const nativeSetter = Object.getOwnPropertyDescriptor(
+                                    textarea.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+                                    'value'
+                                )?.set;
+                                if (nativeSetter) nativeSetter.call(textarea, promptText);
+                                else textarea.value = promptText;
+                                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                                textarea.dispatchEvent(new Event('change', { bubbles: true }));
+                            } else {
+                                // Tiptap/ProseMirror handling
+                                textarea.focus();
+                                
+                                // Clear existing content first
+                                document.execCommand('selectAll', false, null);
+                                document.execCommand('delete', false, null);
+                                await sleep(100);
+                                
+                                // Try paste event first
+                                const dt = new DataTransfer();
+                                dt.setData('text/plain', promptText);
+                                const pasteEvent = new ClipboardEvent('paste', {
+                                    clipboardData: dt,
+                                    bubbles: true,
+                                    cancelable: true
+                                });
+                                textarea.dispatchEvent(pasteEvent);
+                                
+                                await sleep(300);
+                                
+                                // If paste failed, try insertText
+                                if (textarea.textContent.trim() === '') {
+                                    document.execCommand('insertText', false, promptText);
+                                }
+                                
+                                // If insertText failed, try innerHTML
+                                if (textarea.textContent.trim() === '') {
+                                    textarea.innerHTML = `<p>${promptText}</p>`;
+                                    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                                }
+                            }
+                            await sleep(1500); // Give React more time to update state and enable the button
+
+                            // 3. Find and click Generate/Submit button
+                            console.log('[Komfy Grok] 3. Submitting prompt');
+                            let submitBtn = document.querySelector('button[type="submit"]') || document.querySelector('button[aria-label="Submit"]');
+                            
+                            if (!submitBtn) {
+                                const buttons = Array.from(document.querySelectorAll('button'));
+                                submitBtn = buttons.find(btn => {
+                                    const txt = btn.textContent.trim().toLowerCase();
+                                    return txt.includes('generate') || txt.includes('create') || txt.includes('tạo') ||
+                                           txt.includes('submit') || txt.includes('send') || txt.includes('gửi');
+                                });
+                            }
+
+                            if (submitBtn) {
+                                if (submitBtn.disabled) submitBtn.removeAttribute('disabled');
+                                submitBtn.click();
+                            }
+
+                            // 4. Fallback triggers (Enter key and Form Submit)
+                            textarea.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, composed: true }));
+                            
+                            const form = textarea.closest('form');
+                            if (form) {
+                                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                            }
+                            
+                            return { status: 'submitted' };
+                        } catch (err) {
+                            return { error: 'DOM Fallback exception: ' + err.message };
+                        }
+                    },
+                    args: [prompt, grokResolution, grokDuration + 's', grokAspectRatio],
+                });
+
+                const domResult = domFallbackResults?.[0]?.result;
+                if (domResult?.error) throw new Error(domResult.error);
+                console.log('[Komfy Grok] DOM prompt submitted, waiting for video generation...');
+
+                // Background polling loop
+                let attempts = 0;
+                while (attempts < 60) { // 60 * 5s = 5 minutes
+                    await new Promise(r => setTimeout(r, 5000));
+                    attempts++;
+                    console.log(`[Komfy Grok] Polling DOM for video... (attempt ${attempts}/60)`);
+
+                    const checkResults = await chrome.scripting.executeScript({
+                        target: { tabId: grokTabId },
+                        world: 'MAIN',
+                        func: () => {
+                            // Look for video elements
+                            const videos = document.querySelectorAll('video');
+                            for (const video of videos) {
+                                const src = video.src || video.querySelector('source')?.src;
+                                if (src && src.includes('assets.grok.com')) return { videoUrl: src };
+                            }
+
+                            // Look for video links
+                            const links = document.querySelectorAll('a[href*="assets.grok.com"]');
+                            for (const link of links) {
+                                if (link.href.includes('video') || link.href.includes('.mp4')) return { videoUrl: link.href };
+                            }
+
+                            // Check for error messages on screen
+                            const errBox = Array.from(document.querySelectorAll('div')).find(div => 
+                                div.textContent.includes('Failed to generate') || 
+                                div.textContent.includes('Cannot generate')
+                            );
+                            if (errBox) return { errorText: errBox.textContent.trim() };
+
+                            return { waiting: true };
+                        }
+                    });
+
+                    const checkRes = checkResults?.[0]?.result;
+                    if (checkRes?.videoUrl) {
+                        finalVideoUrl = checkRes.videoUrl;
+                        console.log('[Komfy Grok] Found video URL via DOM:', finalVideoUrl);
+                        break;
+                    }
+                    if (checkRes?.errorText) {
+                        throw new Error(`Grok UI showed error: ${checkRes.errorText}`);
+                    }
+                }
+
+                if (!finalVideoUrl) throw new Error('Video generation timed out after 5 minutes');
+            }
+
+            if (finalVideoUrl) {
+                // Download video from URL
+                console.log('[Komfy Grok] Downloading video:', finalVideoUrl.substring(0, 80));
+                try {
+                    const vidFetchRes = await fetch(finalVideoUrl, { redirect: 'follow' });
+                    if (vidFetchRes.ok) {
+                        const buf = await vidFetchRes.arrayBuffer();
+                        const u8 = new Uint8Array(buf);
+                        let b = ''; const C = 8192;
+                        for (let i = 0; i < u8.length; i += C) b += String.fromCharCode.apply(null, u8.subarray(i, i + C));
+                        const b64 = btoa(b);
+                        const mime = vidFetchRes.headers.get('content-type') || 'video/mp4';
+                        result = { ok: true, status: 200, body: JSON.stringify({ base64: b64, mimeType: mime }) };
+                    } else {
+                        // Return URL directly for Studio to handle
+                        result = { ok: true, status: 200, body: JSON.stringify({ videoUrl: finalVideoUrl }) };
+                    }
+                } catch (dlErr) {
+                    result = { ok: true, status: 200, body: JSON.stringify({ videoUrl: finalVideoUrl }) };
+                }
+            } else {
+                throw new Error('Grok returned no video URL from API or DOM fallback');
+            }
+
+
+        } else if (task.endpoint.includes('batchGenerateImages')) {
+            // Image generation — Direct API first (response contains fifeUrl signed URL)
+            const imgBody = typeof task.body === 'string' ? JSON.parse(task.body) : task.body;
+            const imgImageInputs = imgBody.imageInputs || [];
+            const prompt = imgBody.prompt || imgBody.textInput?.structuredPrompt?.parts?.[0]?.text || 'A beautiful image';
+            const aspectRatio = imgBody.aspectRatio || '16:9';
+            const imageType = imgBody.imageType || 'Ingredients';
+            const modelName = imgBody.modelName || 'Nano Banana 2';
+            const pName = imgBody.projectName || null;
+
+            let skipUiFallback = false;
+            try {
+                console.log('[Komfy] Image → Direct API via Electron...');
+                result = await directGenerateImage(task);
+                console.log('[Komfy] Image ✅ Direct API success!');
+            } catch (directErr) {
+                const errMsg = directErr.message || String(directErr);
+                if (errMsg.includes('DIRECT_API_DOWNLOAD_FAILED')) {
+                    console.warn('[Komfy] Image created but download failed:', errMsg.substring(0, 100), '→ NO UI fallback (avoid duplicate)');
+                    skipUiFallback = true;
+                    result = { ok: false, status: 0, error: 'Image generated but download failed.' };
+                } else {
+                    console.warn('[Komfy] Image Direct API failed:', errMsg.substring(0, 100), '→ fallback to UI (CDP)');
+                    result = null;
+                }
+            }
+
+            if (!result && !skipUiFallback) {
+                console.log('[Komfy] Image task (UI fallback CDP) | project:', pName, '| model:', modelName, '| aspect:', aspectRatio);
+                result = await generateImageViaUI(prompt, aspectRatio, imageType, modelName, pName, imgImageInputs, task.requestId);
+            }
+
+
+        } else if (task.endpoint === 'DOWNLOAD_MEDIA_BLOB') {
+            if (!sessionData.bearerToken) {
+                console.log('[Komfy] DOWNLOAD: Chua co token → ensureFlowTab...');
+                await ensureFlowTab(false);
+                const started = Date.now();
+                while (!sessionData.bearerToken && Date.now() - started < 15000) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }
+            result = await downloadBlobViaCDP(task.body);
+
+        } else {
+            if (!sessionData.bearerToken) {
+                console.log('[Komfy] STATUS: Cho token (toi da 25s)...');
+                const started = Date.now();
+                while (!sessionData.bearerToken && Date.now() - started < 25000) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                if (!sessionData.bearerToken) {
+                    throw new Error('Khong co Google session token. Vui long mo tab Google Flow va dang nhap.');
+                }
+            }
+            result = await checkStatusDirect(task.endpoint, task.body);
+        }
+    } catch (e) {
+        const errMsg = e.message || String(e);
+        console.error('[Komfy] Task error:', errMsg);
+        fetch('http://127.0.0.1:3120/debug/log', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ msg: '[Extension Error] ' + errMsg }),
+        }).catch(() => {});
+        result = { ok: false, status: 0, error: errMsg };
+    } finally {
+        // ★ Release project lock — allows queued tasks for other projects to proceed
+        releaseProjectLock(lockProjectName);
+        activeTaskIds.delete(task.requestId);
+    }
+
+    // Gui ket qua ve FlowBroker (retry 3 lan neu fail)
+    const respondBody = JSON.stringify({ requestId: task.requestId, clientId: sessionData.clientId, result });
+    for (let retry = 0; retry < 3; retry++) {
+        try {
+            const resp = await fetch(PROXY_EXECUTE_URL + '/respond', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: respondBody,
+            });
+            if (resp.ok) {
+                console.log('[Komfy] ✅ Respond sent:', task.endpoint, '| requestId:', task.requestId?.substring(0, 12));
+                break;
+            }
+            console.warn('[Komfy] Respond HTTP', resp.status, '| retry', retry + 1);
+        } catch (respondErr) {
+            console.warn('[Komfy] Respond failed (retry', retry + 1 + '):', respondErr.message?.substring(0, 60));
+            if (retry < 2) await new Promise(r => setTimeout(r, 500 * (retry + 1)));
+        }
+    }
+}
+
+// =========================================================
+// LONG-POLL: Nhan lenh tu server
+// Poll loop khong bi block boi task — moi task chay song song
+// UI Mutex (trong image-gen.js/video-gen.js) serialize viec tuong tac UI
+// =========================================================
+const activeTaskIds = new Set();
+
+async function pollForApiRequests() {
+    while (true) {
+        try {
+            if (!sessionData.clientId) { await new Promise(r => setTimeout(r, 1000)); continue; }
+            const res = await fetch(PROXY_EXECUTE_URL + '/poll?clientId=' + sessionData.clientId, {
+                method: 'GET',
+                signal: AbortSignal.timeout(8000), // Khop voi POLL_TIMEOUT_MS=5s + buffer
+            });
+
+            if (res.ok) {
+                const task = await res.json();
+                if (task && task.requestId) {
+                    if (activeTaskIds.has(task.requestId)) {
+                        continue; // Bo qua task bi gui lap lai (thuong do Proxy Server resend vi task chay qua trau)
+                    }
+                    activeTaskIds.add(task.requestId);
+                    
+                    console.log('[Komfy] Task received:', task.endpoint, '| requestId:', task.requestId?.substring(0, 12));
+                    // ★ FIRE AND FORGET: Khong await processTask
+                    // Poll loop NGAY LAP TUC co the nhan task tiep theo
+                    // Extension se xu ly song song, serialize UI qua mutex
+                    // Human-like stagger: random delay before starting task (avoid burst pattern)
+                    const taskDelay = 500 + Math.random() * 1500;
+                    setTimeout(() => {
+                        processTask(task).catch(e => console.error('[Komfy] processTask unhandled:', e.message));
+                    }, taskDelay);
+                }
+            }
+        } catch (e) {
+            if (!e.message || !e.message.includes('aborted')) console.warn('[Komfy Poll]', e.message);
+            await new Promise(r => setTimeout(r, 300 + Math.random() * 700)); // Jitter 300-1000ms
+        }
+    }
+}
+
+// pollForApiRequests() is called from background.js entry point
+
+// Bat headers de cap nhat credentials
+// Chi lang nghe cac domain can thiet (Google APIs + labs.google)
+// Tranh bat toan bo moi request cua Chrome (YouTube, Gmail, ...)
+const TOKEN_CAPTURE_URLS = [
+    '*://labs.google/*',
+    '*://aisandbox-pa.googleapis.com/*',
+    '*://generativeai-pa.googleapis.com/*',
+    '*://firebasevertexai.googleapis.com/*',
+    '*://chatgpt.com/*',
+    '*://grok.com/*',
+];
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+    (details) => {
+        let needsSync = false;
+
+        const auth = details.requestHeaders.find(h => h.name.toLowerCase() === 'authorization');
+        if (auth && auth.value && auth.value.startsWith('Bearer ') && sessionData.bearerToken !== auth.value) {
+            sessionData.bearerToken = auth.value;
+            needsSync = true;
+        }
+        const xbv = details.requestHeaders.find(h => h.name.toLowerCase() === 'x-browser-validation');
+        if (xbv && sessionData.xbv !== xbv.value) {
+            sessionData.xbv = xbv.value;
+            needsSync = true;
+        }
+        // Also capture reCAPTCHA and metadata headers necessary for Google APIs
+        const xClientData = details.requestHeaders.find(h => h.name.toLowerCase() === 'x-client-data');
+        if (xClientData && sessionData.xClientData !== xClientData.value) {
+            sessionData.xClientData = xClientData.value;
+            needsSync = true;
+        }
+
+        const extHeader = details.requestHeaders.find(h => h.name.toLowerCase().startsWith('x-goog-ext-'));
+        if (extHeader) {
+            if (!sessionData.googExts) sessionData.googExts = {};
+            const key = extHeader.name.toLowerCase();
+            if (sessionData.googExts[key] !== extHeader.value) {
+                sessionData.googExts[key] = extHeader.value;
+                needsSync = true;
+            }
+        }
+
+        const match = details.url.match(/projects\/([^\/]+)\/locations/);
+        if (match && sessionData.projectId !== match[1]) {
+            sessionData.projectId = match[1];
+            needsSync = true;
+            console.log('[Komfy] ProjectId captured:', match[1].substring(0, 16) + '...');
+        }
+
+        // Capture ChatGPT headers
+        if (details.url.includes('chatgpt.com/backend-api')) {
+            if (!sessionData.chatgptHeaders) sessionData.chatgptHeaders = {};
+            const gptHeaderNames = [
+                'authorization', 'chatgpt-account-id', 'oai-client-build-number', 
+                'oai-client-version', 'oai-device-id', 'oai-language', 'oai-session-id', 
+                'openai-sentinel-chat-requirements-token', 'openai-sentinel-proof-token', 
+                'openai-sentinel-turnstile-token', 'cookie'
+            ];
+            
+            for (const header of details.requestHeaders) {
+                const name = header.name.toLowerCase();
+                if (gptHeaderNames.includes(name) && sessionData.chatgptHeaders[name] !== header.value) {
+                    sessionData.chatgptHeaders[name] = header.value;
+                    needsSync = true;
+                }
+            }
+        }
+
+        // Capture Grok headers
+        if (details.url.includes('grok.com/rest/')) {
+            if (!sessionData.grokHeaders) sessionData.grokHeaders = {};
+            const grokHeaderNames = [
+                'baggage', 'sentry-trace', 'x-csrf-token', 'x-userid', 'trpc-accept', 'x-xai-userid'
+            ];
+            
+            for (const header of details.requestHeaders) {
+                const name = header.name.toLowerCase();
+                if (grokHeaderNames.includes(name) && sessionData.grokHeaders[name] !== header.value) {
+                    sessionData.grokHeaders[name] = header.value;
+                    needsSync = true;
+                }
+            }
+        }
+
+        // Chi goi sendToProxy 1 lan neu co thay doi (tranh spam nhieu call trong 1 request)
+        if (needsSync) {
+            persistToken(); // Luu token vao session storage
+            sendToProxy().catch(() => {});
+        }
+
+        return { requestHeaders: details.requestHeaders };
+    },
+    { urls: TOKEN_CAPTURE_URLS },
+    ['requestHeaders', 'extraHeaders']
+);
+

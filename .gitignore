@@ -86,3 +86,6 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+### oh-my-openagent tooling state
+.omo/
+

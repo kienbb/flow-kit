@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Nano Banana Bridge</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      width: 300px;
+      background: #0f1117;
+      color: #e0e0e0;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      border-bottom: 1px solid #1e2030;
+    }
+    .header img { width: 20px; height: 20px; border-radius: 4px; }
+    .header h1 { font-size: 13px; font-weight: 600; color: #fff; }
+    .header .version { 
+      font-size: 10px; 
+      color: #5a606e; 
+      margin-left: auto;
+    }
+
+    /* Status Section */
+    .status-section {
+      padding: 12px 16px;
+      border-bottom: 1px solid #1e2030;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 0;
+    }
+    .status-label { font-size: 12px; color: #8b909a; }
+    .status-value {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+    }
+    .dot.green { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    .dot.red { background: #ef4444; }
+    .dot.yellow { background: #f59e0b; }
+    .dot.gray { background: #5a606e; }
+
+    /* Info Section */
+    .info-section {
+      padding: 12px 16px;
+      border-bottom: 1px solid #1e2030;
+    }
+    .info-title {
+      font-size: 10px;
+      color: #5a606e;
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+    }
+    .info-key { font-size: 11px; color: #8b909a; }
+    .info-val {
+      font-size: 11px;
+      font-family: 'Courier New', monospace;
+      color: #a5b4fc;
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .info-val.ok { color: #22c55e; font-family: inherit; }
+    .info-val.err { color: #ef4444; font-family: inherit; }
+
+    /* Actions */
+    .actions {
+      padding: 12px 16px;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 8px;
+      background: transparent;
+      border: 1px solid #2e3144;
+      color: #e0e0e0;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn:hover {
+      background: #1e2030;
+      border-color: #3d4250;
+    }
+    .btn:active { transform: scale(0.97); }
+    
+    .btn-primary {
+      border-color: #6366f155;
+      color: #818cf8;
+    }
+    .btn-primary:hover {
+      background: #6366f122;
+      border-color: #6366f1;
+    }
+    
+    .btn-danger {
+      border-color: #ef444455;
+      color: #ef4444;
+    }
+    .btn-danger:hover {
+      background: #ef444422;
+      border-color: #ef4444;
+    }
+    
+    .btn-warning {
+      border-color: #f59e0b55;
+      color: #f59e0b;
+    }
+    .btn-warning:hover {
+      background: #f59e0b22;
+      border-color: #f59e0b;
+    }
+
+    /* Model Badge */
+    .model-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      background: #6366f122;
+      border: 1px solid #6366f155;
+      border-radius: 4px;
+      font-size: 11px;
+      color: #818cf8;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <img src="../icons/icon-32.png" alt="icon">
+    <h1>Nano Banana Bridge</h1>
+    <span class="version" id="version">v1.0.0</span>
+  </div>
+
+  <div class="status-section">
+    <div class="status-row">
+      <span class="status-label">Extension ID</span>
+      <span class="status-value">
+        <code id="ext-id" style="font-size:10px;">Loading...</code>
+      </span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Google Auth</span>
+      <span class="status-value">
+        <span class="dot gray" id="dot-auth"></span>
+        <span id="status-auth">No token</span>
+      </span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Project</span>
+      <span class="status-value">
+        <span class="dot gray" id="dot-project"></span>
+        <span id="status-project">Not set</span>
+      </span>
+    </div>
+  </div>
+
+  <div class="info-section">
+    <div class="info-title">Session Info</div>
+    <div class="info-row">
+      <span class="info-key">Model</span>
+      <span class="info-val"><span class="model-badge">Nano Banana Pro</span></span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Project ID</span>
+      <span class="info-val" id="info-project-id">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Last Sync</span>
+      <span class="info-val" id="info-last-sync">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Client ID</span>
+      <span class="info-val" id="info-client-id">—</span>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-open-flow">🌐 Open Google Flow</button>
+    <button class="btn btn-primary" id="btn-check-status">🔄 Check Status</button>
+    <button class="btn btn-warning" id="btn-reload">🔄 Reload Extension</button>
+    <button class="btn btn-danger" id="btn-clear">🗑️ Clear Session</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

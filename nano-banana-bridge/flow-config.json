@@ -1,0 +1,75 @@
+{
+  "_comment": "Nano Banana Bridge Config - Google Flow Image Generation",
+  "version": "1.0.0",
+  "lastUpdated": "2026-06-02",
+
+  "googleApi": {
+    "base": "https://aisandbox-pa.googleapis.com/v1",
+    "generateImage": "projects/{projectId}/flowMedia:batchGenerateImages",
+    "uploadImage": "flow/uploadImage",
+    "getMedia": "media/{mediaId}"
+  },
+
+  "trpc": {
+    "createProject": "/fx/api/trpc/project.createProject",
+    "updateProject": "/fx/api/trpc/project.updateProject",
+    "verifyProject": "/fx/api/trpc/flow.projectInitialData"
+  },
+
+  "imageModels": {
+    "nano banana pro": "GEM_PIX_2",
+    "nano banana 2": "NARWHAL",
+    "nano banana": "GEM_PIX_0",
+    "pro": "GEM_PIX_2"
+  },
+
+  "imageAspectRatios": {
+    "16:9": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "landscape": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "9:16": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "portrait": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "1:1": "IMAGE_ASPECT_RATIO_SQUARE",
+    "square": "IMAGE_ASPECT_RATIO_SQUARE"
+  },
+
+  "defaultSettings": {
+    "model": "GEM_PIX_2",
+    "aspectRatio": "IMAGE_ASPECT_RATIO_SQUARE",
+    "imageCount": 4,
+    "safetyLevel": "BLOCK_NONE"
+  },
+
+  "payloads": {
+    "createProject": {
+      "toolName": "PINHOLE"
+    },
+    "updateProject": {
+      "toolName": "PINHOLE",
+      "updateMasks": ["projectTitle"]
+    }
+  },
+
+  "selectors": {
+    "newProject": {
+      "keywords": ["new project", "create project", "dự án mới", "tạo dự án"],
+      "maxTextLength": 40,
+      "strategies": ["textContent", "aria-label", "any-element"]
+    },
+    "projectTitle": {
+      "maxTop": 80,
+      "minWidth": 50,
+      "maxWidth": 500
+    },
+    "promptTextbox": {
+      "selectors": [
+        "[role='textbox']",
+        "textarea",
+        "[contenteditable='true']"
+      ]
+    },
+    "generateButton": {
+      "keywords": ["generate", "tạo", "create"],
+      "strategies": ["textContent", "aria-label"]
+    }
+  }
+}

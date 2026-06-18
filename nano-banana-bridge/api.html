@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Nano Banana Bridge API</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 20px;
+      background: #0f1117;
+      color: #e0e0e0;
+    }
+    h1 { color: #818cf8; }
+    h2 { color: #a5b4fc; margin-top: 30px; }
+    .endpoint {
+      background: #1e2030;
+      padding: 15px;
+      border-radius: 8px;
+      margin: 10px 0;
+      border-left: 3px solid #6366f1;
+    }
+    .method {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: bold;
+      margin-right: 10px;
+    }
+    .method.post { background: #22c55e22; color: #22c55e; }
+    .method.get { background: #3b82f622; color: #3b82f6; }
+    code {
+      background: #2e3144;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+    }
+    pre {
+      background: #2e3144;
+      padding: 15px;
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+    .status {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+    .status.online { background: #22c55e; box-shadow: 0 0 8px #22c55e88; }
+    .status.offline { background: #ef4444; }
+  </style>
+</head>
+<body>
+  <h1>🍌 Nano Banana Bridge API</h1>
+  <p>Extension ID: <span id="extension-id"></span></p>
+  <p><span class="status online" id="status-dot"></span><span id="status-text">API Ready</span></p>
+
+  <h2>Quick Start</h2>
+  <pre>
+// From any web page with the extension installed:
+const EXTENSION_ID = document.getElementById('extension-id').textContent;
+
+chrome.runtime.sendMessage(EXTENSION_ID, {
+  action: 'generate',
+  prompt: 'a beautiful sunset over mountains',
+  aspectRatio: '16:9',
+  count: 4
+}, response => {
+  console.log(response);
+});
+  </pre>
+
+  <h2>API Endpoints</h2>
+
+  <div class="endpoint">
+    <span class="method post">POST</span>
+    <strong>/api/v1/generate</strong>
+    <p>Generate images with specified parameters</p>
+    <pre>
+{
+  "prompt": "a beautiful sunset",
+  "aspectRatio": "16:9",  // 1:1, 16:9, 9:16
+  "count": 4,             // 1-4
+  "model": "nano-banana-pro",  // nano-banana-pro, nano-banana-2, nano-banana
+  "style": "photographic",     // optional
+  "seed": 12345,              // optional
+  "negativePrompt": "blurry"  // optional
+}
+    </pre>
+  </div>
+
+  <div class="endpoint">
+    <span class="method post">POST</span>
+    <strong>/api/v1/generate-batch</strong>
+    <p>Generate multiple images in batch</p>
+    <pre>
+{
+  "prompts": ["sunset", "mountain", "ocean"],
+  "aspectRatio": "1:1",
+  "count": 4
+}
+    </pre>
+  </div>
+
+  <div class="endpoint">
+    <span class="method get">GET</span>
+    <strong>/api/v1/status</strong>
+    <p>Get extension status</p>
+  </div>
+
+  <div class="endpoint">
+    <span class="method get">GET</span>
+    <strong>/api/v1/models</strong>
+    <p>Get available image models</p>
+  </div>
+
+  <div class="endpoint">
+    <span class="method get">GET</span>
+    <strong>/api/v1/aspect-ratios</strong>
+    <p>Get available aspect ratios</p>
+  </div>
+
+  <div class="endpoint">
+    <span class="method get">GET</span>
+    <strong>/api/v1/styles</strong>
+    <p>Get available style presets</p>
+  </div>
+
+  <div class="endpoint">
+    <span class="method post">POST</span>
+    <strong>/api/v1/download</strong>
+    <p>Download image by media ID</p>
+    <pre>
+{
+  "mediaId": "abc123...",
+  "format": "base64"  // base64 or url
+}
+    </pre>
+  </div>
+
+  <div class="endpoint">
+    <span class="method get">GET</span>
+    <strong>/api/v1/session</strong>
+    <p>Get current session info</p>
+  </div>
+
+  <div class="endpoint">
+    <span class="method post">POST</span>
+    <strong>/api/v1/set-project</strong>
+    <p>Set active project ID</p>
+    <pre>{ "projectId": "your-project-id" }</pre>
+  </div>
+
+  <div class="endpoint">
+    <span class="method post">POST</span>
+    <strong>/api/v1/clear-session</strong>
+    <p>Clear all session data</p>
+  </div>
+
+  <script>
+    // Display extension ID
+    document.getElementById('extension-id').textContent = chrome.runtime.id;
+    
+    // Check API status
+    chrome.runtime.sendMessage({ action: 'API_status' }, response => {
+      if (response && response.success) {
+        document.getElementById('status-dot').className = 'status online';
+        document.getElementById('status-text').textContent = 'API Online - Authenticated';
+      } else {
+        document.getElementById('status-dot').className = 'status offline';
+        document.getElementById('status-text').textContent = 'API Online - Not Authenticated';
+      }
+    });
+  </script>
+</body>
+</html>
